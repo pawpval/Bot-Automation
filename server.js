@@ -1,21 +1,21 @@
 import express from "express";
-import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 // ENV
-const GROUP_ID = String(process.env.GROUP_ID || "");
-const ROBLOX_API_KEY = String(process.env.ROBLOX_API_KEY || "");
-const SHARED_SECRET = String(process.env.SHARED_SECRET || "");
+const GROUP_ID = String(process.env.GROUP_ID || "").trim();
+const ROBLOX_API_KEY = String(process.env.ROBLOX_API_KEY || "").trim();
+const SHARED_SECRET = String(process.env.SHARED_SECRET || "").trim();
 
-if (!GROUP_ID) console.warn("Missing GROUP_ID");
-if (!ROBLOX_API_KEY) console.warn("Missing ROBLOX_API_KEY");
-if (!SHARED_SECRET) console.warn("Missing SHARED_SECRET");
+if (!GROUP_ID) console.warn("[ENV] Missing GROUP_ID");
+if (!ROBLOX_API_KEY) console.warn("[ENV] Missing ROBLOX_API_KEY");
+if (!SHARED_SECRET) console.warn("[ENV] Missing SHARED_SECRET");
 
-// XP -> rank number mapping
+// === XP → RANK MAPPING (your system) ===
+// rank here = Roblox role "rank number" (0-255), NOT roleId
 const XP_TO_RANK = [
   { xp: 0,  rank: 1  },  // Cadet
   { xp: 3,  rank: 2  },  // Trooper
@@ -28,7 +28,7 @@ const XP_TO_RANK = [
   { xp: 75, rank: 10 },  // Warrant Officer
 ];
 
-// Safety: never set above this rank number
+// OPTIONAL SAFETY
 const MAX_MANAGED_RANK_NUMBER = 10;
 
 function getTargetRankNumber(xp) {
@@ -39,7 +39,7 @@ function getTargetRankNumber(xp) {
   return result;
 }
 
-let rankToRoleId = new Map();
+let rankToRoleId = new Map(); // rankNumber -> roleId
 let groupOwnerUserId = null;
 
 async function fetchJson(url, opts) {
@@ -52,23 +52,23 @@ async function fetchJson(url, opts) {
 
 async function loadGroupOwner() {
   const { res, data, text } = await fetchJson(`https://groups.roblox.com/v1/groups/${GROUP_ID}`);
-  if (!res.ok) throw new Error(text);
+  if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
   if (data?.owner?.userId) groupOwnerUserId = Number(data.owner.userId);
 }
 
 async function loadRoles() {
   const { res, data, text } = await fetchJson(`https://groups.roblox.com/v1/groups/${GROUP_ID}/roles`);
-  if (!res.ok) throw new Error(text);
+  if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
 
   rankToRoleId.clear();
-  for (const role of data.roles || []) {
+  for (const role of data?.roles || []) {
     rankToRoleId.set(role.rank, role.id);
   }
 }
 
 async function getCurrentRoleId(userId) {
   const { res, data, text } = await fetchJson(`https://groups.roblox.com/v2/users/${userId}/groups/roles`);
-  if (!res.ok) throw new Error(text);
+  if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
 
   const entry = (data?.data || []).find((g) => String(g.group?.id) === String(GROUP_ID));
   return entry?.role?.id ?? null;
@@ -78,7 +78,7 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function promoteUserWithRetry(userId, roleId, tries = 4) {
+async function setUserRoleWithRetry(userId, roleId, tries = 4) {
   const rolePath = `groups/${GROUP_ID}/roles/${roleId}`;
 
   for (let attempt = 1; attempt <= tries; attempt++) {
@@ -97,13 +97,13 @@ async function promoteUserWithRetry(userId, roleId, tries = 4) {
     if (res.ok) return true;
 
     const transient =
-      text.includes("FailedToAcquireLock") ||
-      text.includes("TooManyRequests") ||
+      (text || "").includes("FailedToAcquireLock") ||
+      (text || "").includes("TooManyRequests") ||
       res.status === 429 ||
       res.status >= 500;
 
     if (!transient || attempt === tries) {
-      throw new Error(text);
+      throw new Error(text || `Roblox API failed HTTP ${res.status}`);
     }
 
     await sleep(250 * attempt);
@@ -112,15 +112,16 @@ async function promoteUserWithRetry(userId, roleId, tries = 4) {
   return false;
 }
 
-async function handlePromote(req, res) {
+async function handleUpdate(req, res) {
   try {
-    const { userId, xp, secret, loaded } = req.body || {};
+    const body = req.body || {};
+    const { userId, xp, secret, loaded } = body;
 
     if (secret !== SHARED_SECRET) {
       return res.status(401).json({ error: "Invalid secret" });
     }
 
-    // ✅ CRITICAL: prevent “XP not loaded yet -> Cadet”
+    // ✅ CRITICAL: prevents “XP not loaded yet => Cadet”
     if (loaded !== true) {
       return res.json({ success: true, skipped: true, reason: "NotLoaded" });
     }
@@ -135,13 +136,13 @@ async function handlePromote(req, res) {
       return res.status(400).json({ error: "Bad xp" });
     }
 
-    if (!groupOwnerUserId) {
+    // lazy init
+    if (!rankToRoleId.size) await loadRoles();
+    if (groupOwnerUserId == null) {
       try { await loadGroupOwner(); } catch {}
     }
-    if (!rankToRoleId.size) {
-      await loadRoles();
-    }
 
+    // never touch group owner
     if (groupOwnerUserId && uid === groupOwnerUserId) {
       return res.json({ success: true, skipped: true, reason: "GroupOwner" });
     }
@@ -151,7 +152,7 @@ async function handlePromote(req, res) {
 
     const targetRoleId = rankToRoleId.get(targetRankNumber);
     if (!targetRoleId) {
-      return res.status(400).json({ error: "Role not found for target rank" });
+      return res.status(400).json({ error: "Role not found for target rank number", rank: targetRankNumber });
     }
 
     const currentRoleId = await getCurrentRoleId(uid);
@@ -159,26 +160,28 @@ async function handlePromote(req, res) {
       return res.json({ success: true, skipped: true, reason: "AlreadyCorrect", rank: targetRankNumber });
     }
 
-    await promoteUserWithRetry(uid, targetRoleId);
+    await setUserRoleWithRetry(uid, targetRoleId);
     return res.json({ success: true, rank: targetRankNumber });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Promotion failed" });
+    console.error("[/update-xp] failed:", err?.message || err);
+    return res.status(500).json({ error: "Promotion failed", details: String(err?.message || err) });
   }
 }
 
-// ✅ Support both routes
-app.post("/promote", handlePromote);
-app.post("/update-xp", handlePromote);
+// ✅ both endpoints
+app.post("/update-xp", handleUpdate);
+app.post("/promote", handleUpdate);
 
 app.get("/", (req, res) => res.send("Rank bot running"));
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   try {
-    await loadGroupOwner();
     await loadRoles();
-  } catch {
-    console.log("Preload failed (will still work on first request).");
+    await loadGroupOwner();
+    console.log("Preloaded roles + owner OK");
+  } catch (e) {
+    console.log("Preload failed (will retry on first request):", e?.message || e);
   }
 });
