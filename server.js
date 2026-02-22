@@ -1,4 +1,5 @@
 import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
@@ -10,8 +11,11 @@ const GROUP_ID = String(process.env.GROUP_ID || "");
 const ROBLOX_API_KEY = String(process.env.ROBLOX_API_KEY || "");
 const SHARED_SECRET = String(process.env.SHARED_SECRET || "");
 
-// === XP → RANK MAPPING (your system) ===
-// rank here = Roblox role "rank number" (0-255), NOT roleId
+if (!GROUP_ID) console.warn("Missing GROUP_ID");
+if (!ROBLOX_API_KEY) console.warn("Missing ROBLOX_API_KEY");
+if (!SHARED_SECRET) console.warn("Missing SHARED_SECRET");
+
+// XP -> rank number mapping
 const XP_TO_RANK = [
   { xp: 0,  rank: 1  },  // Cadet
   { xp: 3,  rank: 2  },  // Trooper
@@ -24,9 +28,8 @@ const XP_TO_RANK = [
   { xp: 75, rank: 10 },  // Warrant Officer
 ];
 
-// OPTIONAL SAFETY: do not allow the bot to set anything above this rank number.
-// (Prevents touching staff even if your Roblox server sends bad XP/rank.)
-const MAX_MANAGED_RANK_NUMBER = 10; // Warrant Officer
+// Safety: never set above this rank number
+const MAX_MANAGED_RANK_NUMBER = 10;
 
 function getTargetRankNumber(xp) {
   let result = 1;
@@ -36,7 +39,6 @@ function getTargetRankNumber(xp) {
   return result;
 }
 
-// rankNumber -> roleId
 let rankToRoleId = new Map();
 let groupOwnerUserId = null;
 
@@ -51,11 +53,7 @@ async function fetchJson(url, opts) {
 async function loadGroupOwner() {
   const { res, data, text } = await fetchJson(`https://groups.roblox.com/v1/groups/${GROUP_ID}`);
   if (!res.ok) throw new Error(text);
-
-  // groups.roblox.com/v1/groups/:id usually returns owner info
-  if (data?.owner?.userId) {
-    groupOwnerUserId = Number(data.owner.userId);
-  }
+  if (data?.owner?.userId) groupOwnerUserId = Number(data.owner.userId);
 }
 
 async function loadRoles() {
@@ -69,9 +67,7 @@ async function loadRoles() {
 }
 
 async function getCurrentRoleId(userId) {
-  const { res, data, text } = await fetchJson(
-    `https://groups.roblox.com/v2/users/${userId}/groups/roles`
-  );
+  const { res, data, text } = await fetchJson(`https://groups.roblox.com/v2/users/${userId}/groups/roles`);
   if (!res.ok) throw new Error(text);
 
   const entry = (data?.data || []).find((g) => String(g.group?.id) === String(GROUP_ID));
@@ -82,7 +78,6 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// retry for lock/rate errors
 async function promoteUserWithRetry(userId, roleId, tries = 4) {
   const rolePath = `groups/${GROUP_ID}/roles/${roleId}`;
 
@@ -101,7 +96,6 @@ async function promoteUserWithRetry(userId, roleId, tries = 4) {
 
     if (res.ok) return true;
 
-    // Retry only for common transient cases
     const transient =
       text.includes("FailedToAcquireLock") ||
       text.includes("TooManyRequests") ||
@@ -112,18 +106,23 @@ async function promoteUserWithRetry(userId, roleId, tries = 4) {
       throw new Error(text);
     }
 
-    await sleep(250 * attempt); // small backoff
+    await sleep(250 * attempt);
   }
 
   return false;
 }
 
-app.post("/promote", async (req, res) => {
+async function handlePromote(req, res) {
   try {
-    const { userId, xp, secret } = req.body || {};
+    const { userId, xp, secret, loaded } = req.body || {};
 
     if (secret !== SHARED_SECRET) {
       return res.status(401).json({ error: "Invalid secret" });
+    }
+
+    // ✅ CRITICAL: prevent “XP not loaded yet -> Cadet”
+    if (loaded !== true) {
+      return res.json({ success: true, skipped: true, reason: "NotLoaded" });
     }
 
     const uid = Number(userId);
@@ -136,7 +135,6 @@ app.post("/promote", async (req, res) => {
       return res.status(400).json({ error: "Bad xp" });
     }
 
-    // lazy init
     if (!groupOwnerUserId) {
       try { await loadGroupOwner(); } catch {}
     }
@@ -144,37 +142,34 @@ app.post("/promote", async (req, res) => {
       await loadRoles();
     }
 
-    // never touch group owner
     if (groupOwnerUserId && uid === groupOwnerUserId) {
       return res.json({ success: true, skipped: true, reason: "GroupOwner" });
     }
 
     let targetRankNumber = getTargetRankNumber(xpNum);
-
-    // safety cap (prevents staff being touched)
-    if (targetRankNumber > MAX_MANAGED_RANK_NUMBER) {
-      targetRankNumber = MAX_MANAGED_RANK_NUMBER;
-    }
+    if (targetRankNumber > MAX_MANAGED_RANK_NUMBER) targetRankNumber = MAX_MANAGED_RANK_NUMBER;
 
     const targetRoleId = rankToRoleId.get(targetRankNumber);
     if (!targetRoleId) {
       return res.status(400).json({ error: "Role not found for target rank" });
     }
 
-    // Skip if already correct (prevents spam + lock errors)
     const currentRoleId = await getCurrentRoleId(uid);
     if (currentRoleId && String(currentRoleId) === String(targetRoleId)) {
       return res.json({ success: true, skipped: true, reason: "AlreadyCorrect", rank: targetRankNumber });
     }
 
     await promoteUserWithRetry(uid, targetRoleId);
-
-    res.json({ success: true, rank: targetRankNumber });
+    return res.json({ success: true, rank: targetRankNumber });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Promotion failed" });
+    return res.status(500).json({ error: "Promotion failed" });
   }
-});
+}
+
+// ✅ Support both routes
+app.post("/promote", handlePromote);
+app.post("/update-xp", handlePromote);
 
 app.get("/", (req, res) => res.send("Rank bot running"));
 
@@ -187,4 +182,3 @@ app.listen(PORT, async () => {
     console.log("Preload failed (will still work on first request).");
   }
 });
-
