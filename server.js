@@ -14,32 +14,24 @@ if (!GROUP_ID) console.warn("[ENV] Missing GROUP_ID");
 if (!ROBLOX_API_KEY) console.warn("[ENV] Missing ROBLOX_API_KEY");
 if (!SHARED_SECRET) console.warn("[ENV] Missing SHARED_SECRET");
 
-// === XP → RANK MAPPING (your system) ===
-// rank here = Roblox role "rank number" (0-255), NOT roleId
-const XP_TO_RANK = [
-  { xp: 0,  rank: 1  },  // Cadet
-  { xp: 3,  rank: 2  },  // Trooper
-  { xp: 6,  rank: 3  },  // Specialist
-  { xp: 12, rank: 4  },  // Corporal
-  { xp: 18, rank: 5  },  // Sergeant
-  { xp: 28, rank: 7  },  // Staff Sergeant
-  { xp: 35, rank: 8  },  // Master Sergeant
-  { xp: 50, rank: 9  },  // Sergeant Major
-  { xp: 75, rank: 10 },  // Warrant Officer
+// XP -> ROLE NAME (THIS is robust)
+const XP_TO_ROLE_NAME = [
+  { xp: 0,  roleName: "Cadet" },
+  { xp: 3,  roleName: "Trooper" },
+  { xp: 6,  roleName: "Specialist" },
+  { xp: 12, roleName: "Corporal" },
+  { xp: 18, roleName: "Sergeant" },
+  { xp: 28, roleName: "Staff Sergeant" },
+  { xp: 35, roleName: "Master Sergeant" },
+  { xp: 50, roleName: "Sergeant Major" },
+  { xp: 75, roleName: "Warrant Officer" }
 ];
 
-// OPTIONAL SAFETY
-const MAX_MANAGED_RANK_NUMBER = 10;
+// safety cap (won’t touch anything above this role in the list)
+const MAX_MANAGED_INDEX = XP_TO_ROLE_NAME.length - 1;
 
-function getTargetRankNumber(xp) {
-  let result = 1;
-  for (const tier of XP_TO_RANK) {
-    if (xp >= tier.xp) result = tier.rank;
-  }
-  return result;
-}
-
-let rankToRoleId = new Map(); // rankNumber -> roleId
+// roleName -> roleId
+let roleNameToId = new Map();
 let groupOwnerUserId = null;
 
 async function fetchJson(url, opts) {
@@ -48,6 +40,15 @@ async function fetchJson(url, opts) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch {}
   return { res, text, data };
+}
+
+function pickRoleNameForXP(xp) {
+  let idx = 0;
+  for (let i = 0; i < XP_TO_ROLE_NAME.length; i++) {
+    if (xp >= XP_TO_ROLE_NAME[i].xp) idx = i;
+  }
+  if (idx > MAX_MANAGED_INDEX) idx = MAX_MANAGED_INDEX;
+  return XP_TO_ROLE_NAME[idx].roleName;
 }
 
 async function loadGroupOwner() {
@@ -60,10 +61,14 @@ async function loadRoles() {
   const { res, data, text } = await fetchJson(`https://groups.roblox.com/v1/groups/${GROUP_ID}/roles`);
   if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
 
-  rankToRoleId.clear();
+  roleNameToId.clear();
   for (const role of data?.roles || []) {
-    rankToRoleId.set(role.rank, role.id);
+    // normalize names
+    roleNameToId.set(String(role.name).trim().toLowerCase(), role.id);
   }
+
+  // quick sanity log
+  console.log("[Roles] Loaded role names:", Array.from(roleNameToId.keys()).slice(0, 25));
 }
 
 async function getCurrentRoleId(userId) {
@@ -78,7 +83,7 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function setUserRoleWithRetry(userId, roleId, tries = 4) {
+async function setUserRoleWithRetry(userId, roleId, tries = 5) {
   const rolePath = `groups/${GROUP_ID}/roles/${roleId}`;
 
   for (let attempt = 1; attempt <= tries; attempt++) {
@@ -98,7 +103,6 @@ async function setUserRoleWithRetry(userId, roleId, tries = 4) {
 
     const transient =
       (text || "").includes("FailedToAcquireLock") ||
-      (text || "").includes("TooManyRequests") ||
       res.status === 429 ||
       res.status >= 500;
 
@@ -106,22 +110,22 @@ async function setUserRoleWithRetry(userId, roleId, tries = 4) {
       throw new Error(text || `Roblox API failed HTTP ${res.status}`);
     }
 
-    await sleep(250 * attempt);
+    await sleep(350 * attempt);
   }
 
   return false;
 }
 
 async function handleUpdate(req, res) {
-  try {
-    const body = req.body || {};
-    const { userId, xp, secret, loaded } = body;
+  const body = req.body || {};
+  const { userId, xp, secret, loaded } = body;
 
+  try {
     if (secret !== SHARED_SECRET) {
       return res.status(401).json({ error: "Invalid secret" });
     }
 
-    // ✅ CRITICAL: prevents “XP not loaded yet => Cadet”
+    // ✅ prevents “XP not loaded yet => Cadet”
     if (loaded !== true) {
       return res.json({ success: true, skipped: true, reason: "NotLoaded" });
     }
@@ -129,50 +133,56 @@ async function handleUpdate(req, res) {
     const uid = Number(userId);
     const xpNum = Number(xp);
 
-    if (!Number.isFinite(uid) || uid <= 0) {
-      return res.status(400).json({ error: "Bad userId" });
-    }
-    if (!Number.isFinite(xpNum) || xpNum < 0) {
-      return res.status(400).json({ error: "Bad xp" });
-    }
+    if (!Number.isFinite(uid) || uid <= 0) return res.status(400).json({ error: "Bad userId" });
+    if (!Number.isFinite(xpNum) || xpNum < 0) return res.status(400).json({ error: "Bad xp" });
 
-    // lazy init
-    if (!rankToRoleId.size) await loadRoles();
+    // init caches
+    if (!roleNameToId.size) await loadRoles();
     if (groupOwnerUserId == null) {
       try { await loadGroupOwner(); } catch {}
     }
 
-    // never touch group owner
     if (groupOwnerUserId && uid === groupOwnerUserId) {
       return res.json({ success: true, skipped: true, reason: "GroupOwner" });
     }
 
-    let targetRankNumber = getTargetRankNumber(xpNum);
-    if (targetRankNumber > MAX_MANAGED_RANK_NUMBER) targetRankNumber = MAX_MANAGED_RANK_NUMBER;
+    const targetRoleName = pickRoleNameForXP(xpNum).toLowerCase();
+    const targetRoleId = roleNameToId.get(targetRoleName);
 
-    const targetRoleId = rankToRoleId.get(targetRankNumber);
     if (!targetRoleId) {
-      return res.status(400).json({ error: "Role not found for target rank number", rank: targetRankNumber });
+      // This is THE big debugging signal if your group role names don’t match
+      console.error("[Promote] Role name not found in group:", targetRoleName);
+      return res.status(400).json({
+        error: "RoleNameNotFound",
+        targetRoleName,
+        hint: "Check the group role names exactly match (Cadet, Trooper, ...)."
+      });
     }
 
     const currentRoleId = await getCurrentRoleId(uid);
     if (currentRoleId && String(currentRoleId) === String(targetRoleId)) {
-      return res.json({ success: true, skipped: true, reason: "AlreadyCorrect", rank: targetRankNumber });
+      return res.json({ success: true, skipped: true, reason: "AlreadyCorrect", roleName: targetRoleName });
     }
 
     await setUserRoleWithRetry(uid, targetRoleId);
-    return res.json({ success: true, rank: targetRankNumber });
+
+    return res.json({ success: true, roleName: targetRoleName });
   } catch (err) {
-    console.error("[/update-xp] failed:", err?.message || err);
-    return res.status(500).json({ error: "Promotion failed", details: String(err?.message || err) });
+    console.error("[/update-xp] FAIL:", {
+      message: err?.message || String(err),
+      body
+    });
+    return res.status(500).json({
+      error: "Promotion failed",
+      details: String(err?.message || err)
+    });
   }
 }
 
-// ✅ both endpoints
-app.post("/update-xp", handleUpdate);
-app.post("/promote", handleUpdate);
+app.post("/update-xp", handleUpdate); // ✅ your endpoint
+app.post("/promote", handleUpdate);   // ✅ compatibility
 
-app.get("/", (req, res) => res.send("Rank bot running"));
+app.get("/", (req, res) => res.send("Bot automation running"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, async () => {
