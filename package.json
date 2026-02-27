@@ -1,9 +1,8 @@
 {
-  "name": "tarc-rank-promotion",
+  "name": "bot-automation",
   "version": "1.0.0",
-  "description": "TARC XP -> Rank bot",
-  "main": "server.js",
   "type": "module",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
